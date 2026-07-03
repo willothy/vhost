@@ -143,6 +143,21 @@ impl Backend {
     pub fn set_failed(&self, error: i32) {
         self.inner.lock().unwrap().error = Some(error);
     }
+
+    /// Notify the frontend that the device's configuration space has changed,
+    /// asking it to re-read the configuration. Used when a vhost-user
+    /// backend's config changes at runtime — for example, a block device
+    /// whose capacity grew online. Requires the frontend to have negotiated
+    /// `VHOST_USER_PROTOCOL_F_CONFIG`; it is delivered to the frontend's
+    /// [`VhostUserFrontendReqHandler::handle_config_change`]. The message
+    /// carries no body.
+    pub fn config_change(&self) -> HandlerResult<u64> {
+        Ok(self.inner.lock().unwrap().send_message(
+            BackendReq::CONFIG_CHANGE_MSG,
+            &VhostUserEmpty,
+            None,
+        )?)
+    }
 }
 
 impl VhostUserFrontendReqHandler for Backend {
