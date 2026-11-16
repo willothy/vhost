@@ -116,6 +116,22 @@ pub trait VhostUserFrontend: VhostBackend {
     /// sent by [`VhostUserFrontend::postcopy_advise`].
     #[cfg(feature = "postcopy")]
     fn postcopy_end(&mut self) -> Result<()>;
+
+    /// Sends postcopy's VHOST_USER_SET_MEM_TABLE, once
+    /// [`VhostUserFrontend::postcopy_listen`] has been acknowledged: the
+    /// back-end maps the regions, registers them with its userfaultfd, and
+    /// replies with where it mapped each. Returns those mapping bases, in the
+    /// order of `regions`. The back-end handles nothing else until the
+    /// front-end, now able to serve its faults, calls
+    /// [`VhostUserFrontend::postcopy_ack_mem_table`].
+    #[cfg(feature = "postcopy")]
+    fn set_mem_table_postcopy(&mut self, regions: &[VhostUserMemoryRegionInfo])
+        -> Result<Vec<u64>>;
+
+    /// Acknowledges a postcopy memory table reply: the front-end serves the
+    /// faults the back-end takes on the mappings it reported.
+    #[cfg(feature = "postcopy")]
+    fn postcopy_ack_mem_table(&mut self) -> Result<()>;
 }
 
 fn error_code<T>(err: VhostUserError) -> Result<T> {
@@ -671,6 +687,79 @@ impl VhostUserFrontend for Frontend {
         node.check_proto_feature(VhostUserProtocolFeatures::PAGEFAULT)?;
         let hdr = node.send_request_header(FrontendReq::POSTCOPY_END, None)?;
         node.wait_for_ack(&hdr).map_err(|e| e.into())
+    }
+
+    #[cfg(feature = "postcopy")]
+    fn set_mem_table_postcopy(
+        &mut self,
+        regions: &[VhostUserMemoryRegionInfo],
+    ) -> Result<Vec<u64>> {
+        if regions.is_empty() || regions.len() > MAX_ATTACHED_FD_ENTRIES {
+            return error_code(VhostUserError::InvalidParam);
+        }
+        let mut ctx = VhostUserMemoryContext::new();
+        for region in regions.iter() {
+            if region.memory_size == 0 || region.mmap_handle < 0 {
+                return error_code(VhostUserError::InvalidParam);
+            }
+            ctx.append(&region.to_region(), region.mmap_handle);
+        }
+
+        let mut node = self.node();
+        node.check_proto_feature(VhostUserProtocolFeatures::PAGEFAULT)?;
+        node.check_state()?;
+        let body = VhostUserMemory::new(ctx.regions.len() as u32);
+        // SAFETY: Safe because ctx.regions is a valid Vec() at this point.
+        let (_, payload, _) = unsafe { ctx.regions.align_to::<u8>() };
+        // The reply is the back-end's table, not an ack: NEED_REPLY stays
+        // clear whatever the session's header flags.
+        let hdr = VhostUserMsgHeader::new(
+            FrontendReq::SET_MEM_TABLE,
+            0x1,
+            (mem::size_of::<VhostUserMemory>() + payload.len()) as u32,
+        );
+        node.main_sock
+            .send_message_with_payload(&hdr, &body, payload, Some(ctx.fds.as_slice()))?;
+
+        let (reply, buf, _) = node.recv_reply_with_payload::<VhostUserMemory>(&hdr)?;
+        if reply.num_regions as usize != ctx.regions.len()
+            || buf.len() != ctx.regions.len() * mem::size_of::<VhostUserMemoryRegion>()
+        {
+            return error_code(VhostUserError::InvalidMessage);
+        }
+        ctx.regions
+            .iter()
+            .enumerate()
+            .map(|(i, sent)| {
+                let offset = i * mem::size_of::<VhostUserMemoryRegion>();
+                // SAFETY: `buf` holds exactly one VhostUserMemoryRegion per
+                // sent region, checked above; the read is unaligned-safe.
+                let mapped = unsafe {
+                    std::ptr::read_unaligned(buf[offset..].as_ptr() as *const VhostUserMemoryRegion)
+                };
+                let (mapped_gpa, sent_gpa) = (mapped.guest_phys_addr, sent.guest_phys_addr);
+                let (mapped_size, sent_size) = (mapped.memory_size, sent.memory_size);
+                if mapped_gpa != sent_gpa || mapped_size != sent_size || mapped.user_addr == 0 {
+                    return error_code(VhostUserError::InvalidMessage);
+                }
+                Ok(mapped.user_addr)
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "postcopy")]
+    fn postcopy_ack_mem_table(&mut self) -> Result<()> {
+        let mut node = self.node();
+        node.check_proto_feature(VhostUserProtocolFeatures::PAGEFAULT)?;
+        node.check_state()?;
+        let hdr = VhostUserMsgHeader::new(
+            FrontendReq::SET_MEM_TABLE,
+            0x1,
+            mem::size_of::<VhostUserU64>() as u32,
+        );
+        node.main_sock
+            .send_message(&hdr, &VhostUserU64::new(0), None)?;
+        Ok(())
     }
 }
 

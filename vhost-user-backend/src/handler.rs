@@ -7,15 +7,13 @@ use std::error;
 use std::fs::File;
 use std::io;
 use std::os::fd::AsFd;
-#[cfg(feature = "postcopy")]
-use std::os::fd::FromRawFd;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::thread;
 
 use crate::bitmap::{BitmapReplace, MemRegionBitmap, MmapLogReg};
 #[cfg(feature = "postcopy")]
-use userfaultfd::{Uffd, UffdBuilder};
+use crate::uffd::Uffd;
 use vhost::vhost_user::message::{
     VhostTransferStateDirection, VhostTransferStatePhase, VhostUserConfigFlags, VhostUserLog,
     VhostUserMemoryRegion, VhostUserProtocolFeatures, VhostUserShMemConfig, VhostUserSharedMsg,
@@ -103,6 +101,10 @@ pub struct VhostUserHandler<T: VhostUserBackend> {
     vrings: Vec<T::Vring>,
     #[cfg(feature = "postcopy")]
     uffd: Option<Uffd>,
+    /// Whether postcopy is listening: memory mapped from now on is
+    /// registered with `uffd` before anything can touch it.
+    #[cfg(feature = "postcopy")]
+    postcopy_listening: bool,
     worker_threads: Vec<thread::JoinHandle<VringEpollResult<()>>>,
 }
 
@@ -164,6 +166,8 @@ where
             vrings,
             #[cfg(feature = "postcopy")]
             uffd: None,
+            #[cfg(feature = "postcopy")]
+            postcopy_listening: false,
             worker_threads,
         })
     }
@@ -184,6 +188,22 @@ impl<T: VhostUserBackend> VhostUserHandler<T> {
         }
 
         Err(VhostUserHandlerError::MissingMemoryMapping)
+    }
+
+    /// Register `mappings` with the postcopy userfaultfd, missing-only, so
+    /// a touch of a page the front-end has not yet served faults to it.
+    #[cfg(feature = "postcopy")]
+    fn register_postcopy_mappings(&self, mappings: &[AddrMapping]) -> VhostUserResult<()> {
+        let Some(ref uffd) = self.uffd else {
+            return Err(VhostUserError::ReqHandlerError(io::Error::other(
+                "No registered UFFD handler",
+            )));
+        };
+        for mapping in mappings {
+            uffd.register(mapping.local_addr, mapping.size)
+                .map_err(VhostUserError::ReqHandlerError)?;
+        }
+        Ok(())
     }
 }
 
@@ -355,6 +375,13 @@ where
 
         let mem = GuestMemoryMmap::from_regions(regions)
             .map_err(|e| VhostUserError::ReqHandlerError(io::Error::other(e)))?;
+
+        // While postcopy listens, the new mappings fault through the
+        // front-end before the vrings or the backend can reach them.
+        #[cfg(feature = "postcopy")]
+        if self.postcopy_listening {
+            self.register_postcopy_mappings(&mappings)?;
+        }
 
         // Updating the inner GuestMemory object here will cause all our vrings to
         // see the new one the next time they call to `atomic_mem.memory()`.
@@ -696,59 +723,41 @@ where
 
     #[cfg(feature = "postcopy")]
     fn postcopy_advice(&mut self) -> VhostUserResult<File> {
-        let mut uffd_builder = UffdBuilder::new();
-
-        let uffd = uffd_builder
-            .close_on_exec(true)
-            .non_blocking(true)
-            .user_mode_only(false)
-            .create()
-            .map_err(|e| VhostUserError::ReqHandlerError(io::Error::other(e)))?;
-
-        // We need to duplicate the uffd fd because we need both
-        // to return File with fd and store fd inside uffd.
-        //
-        // SAFETY:
-        // We know that uffd is correctly created.
-        // This means fd inside uffd is also a valid fd.
-        // Duplicating a valid fd is safe.
-        let uffd_dup = unsafe { libc::dup(uffd.as_raw_fd()) };
-        if uffd_dup < 0 {
-            return Err(VhostUserError::ReqHandlerError(io::Error::last_os_error()));
-        }
-
-        // SAFETY:
-        // We know that uffd_dup is a valid fd.
-        let uffd_file = unsafe { File::from_raw_fd(uffd_dup) };
-
+        // The front-end learns from unmap events when a mapping it serves
+        // faults for is gone, so it can stop serving this userfaultfd once
+        // none remain.
+        let uffd = Uffd::create().map_err(VhostUserError::ReqHandlerError)?;
+        let uffd_file = uffd
+            .try_clone_file()
+            .map_err(VhostUserError::ReqHandlerError)?;
         self.uffd = Some(uffd);
-
         Ok(uffd_file)
     }
 
     #[cfg(feature = "postcopy")]
     fn postcopy_listen(&mut self) -> VhostUserResult<()> {
-        let Some(ref uffd) = self.uffd else {
-            return Err(VhostUserError::ReqHandlerError(io::Error::other(
-                "No registered UFFD handler",
-            )));
-        };
-
-        for mapping in self.mappings.iter() {
-            uffd.register(
-                mapping.local_addr as *mut libc::c_void,
-                mapping.size as usize,
-            )
-            .map_err(|e| VhostUserError::ReqHandlerError(io::Error::other(e)))?;
-        }
-
+        let mappings = std::mem::take(&mut self.mappings);
+        let registered = self.register_postcopy_mappings(&mappings);
+        self.mappings = mappings;
+        registered?;
+        self.postcopy_listening = true;
         Ok(())
     }
 
     #[cfg(feature = "postcopy")]
     fn postcopy_end(&mut self) -> VhostUserResult<()> {
+        self.postcopy_listening = false;
         self.uffd = None;
         Ok(())
+    }
+
+    #[cfg(feature = "postcopy")]
+    fn postcopy_region_base(&mut self, guest_phys_addr: u64) -> VhostUserResult<u64> {
+        self.mappings
+            .iter()
+            .find(|mapping| mapping.gpa_base == guest_phys_addr)
+            .map(|mapping| mapping.local_addr)
+            .ok_or(VhostUserError::InvalidParam)
     }
 
     // Sets logging (i.e., bitmap) shared memory space.

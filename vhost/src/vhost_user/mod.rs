@@ -554,6 +554,67 @@ mod tests {
         mbar.wait();
     }
 
+    /// Postcopy's memory table: the back-end replies with where it mapped
+    /// each region and waits for the front-end's acknowledgement before
+    /// handling the next request; a region added while listening is refused.
+    #[cfg(feature = "postcopy")]
+    #[test]
+    fn test_postcopy_mem_table_reports_backend_bases() {
+        use super::dummy_backend::DUMMY_POSTCOPY_MAPPING_OFFSET;
+
+        let path = temp_path();
+        let backend_be = Arc::new(Mutex::new(DummyBackendReqHandler::new()));
+        let (mut frontend, mut backend) = create_backend(path, backend_be);
+        let served = thread::spawn(move || {
+            // set_owner, get/set_features, get/set_protocol_features,
+            // postcopy_advise, postcopy_listen
+            for _ in 0..7 {
+                backend.handle_request().unwrap();
+            }
+            // The postcopy memory table, through to the front-end's ack.
+            backend.handle_request().unwrap();
+            // get_queue_num answers only after the ack was consumed.
+            backend.handle_request().unwrap();
+            backend.handle_request().unwrap_err();
+        });
+
+        frontend.set_owner().unwrap();
+        frontend.get_features().unwrap();
+        frontend.set_features(VIRTIO_FEATURES & !0x1).unwrap();
+        let mut features = frontend.get_protocol_features().unwrap();
+        features.remove(VhostUserProtocolFeatures::XEN_MMAP);
+        frontend.set_protocol_features(features).unwrap();
+        frontend.postcopy_advise().unwrap();
+        frontend.postcopy_listen().unwrap();
+
+        let first = TempFile::new().unwrap().into_file();
+        let second = TempFile::new().unwrap().into_file();
+        let mem = [
+            VhostUserMemoryRegionInfo::new(0, 0x10_0000, 0x7000_0000, 0, first.as_raw_fd()),
+            VhostUserMemoryRegionInfo::new(
+                0x1_0000_0000,
+                0x10_0000,
+                0x7100_0000,
+                0,
+                second.as_raw_fd(),
+            ),
+        ];
+        let bases = frontend.set_mem_table_postcopy(&mem).unwrap();
+        assert_eq!(
+            bases,
+            [
+                DUMMY_POSTCOPY_MAPPING_OFFSET,
+                DUMMY_POSTCOPY_MAPPING_OFFSET + 0x1_0000_0000
+            ]
+        );
+        frontend.postcopy_ack_mem_table().unwrap();
+        assert_eq!(frontend.get_queue_num().unwrap(), 2);
+
+        let region = VhostUserMemoryRegionInfo::new(0x2_0000_0000, 0x1000, 0, 0, first.as_raw_fd());
+        let _ = frontend.add_mem_region(&region);
+        served.join().unwrap();
+    }
+
     #[test]
     fn test_error_display() {
         assert_eq!(format!("{}", Error::InvalidParam), "invalid parameters");
