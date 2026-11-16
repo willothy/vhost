@@ -21,6 +21,9 @@ const UFFD_API: u64 = 0xaa;
 const UFFD_FEATURE_EVENT_UNMAP: u64 = 1 << 6;
 /// `UFFDIO_REGISTER_MODE_MISSING`.
 const UFFDIO_REGISTER_MODE_MISSING: u64 = 1 << 0;
+/// `1 << _UFFDIO_COPY` in the `ioctls` a registration reports: the
+/// front-end resolves missing faults on the range with `UFFDIO_COPY`.
+const UFFDIO_COPY_SUPPORTED: u64 = 1 << 0x03;
 
 #[repr(C)]
 struct UffdioApi {
@@ -101,7 +104,9 @@ impl Uffd {
         Ok(Self { fd })
     }
 
-    /// Register `[addr, addr + len)` for missing faults.
+    /// Register `[addr, addr + len)` for missing faults. Fails when the
+    /// kernel cannot resolve faults on the range with `UFFDIO_COPY`, since
+    /// the front-end could then never serve them.
     pub(crate) fn register(&self, addr: u64, len: u64) -> io::Result<()> {
         let mut register = UffdioRegister {
             start: addr,
@@ -114,6 +119,14 @@ impl Uffd {
         // mappings.
         if unsafe { libc::ioctl(self.fd.as_raw_fd(), UFFDIO_REGISTER as _, &mut register) } < 0 {
             return Err(io::Error::last_os_error());
+        }
+        if register.ioctls & UFFDIO_COPY_SUPPORTED == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "the userfaultfd cannot resolve faults on {addr:#x}+{len:#x} with UFFDIO_COPY"
+                ),
+            ));
         }
         Ok(())
     }
