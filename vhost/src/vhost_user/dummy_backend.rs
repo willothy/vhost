@@ -10,6 +10,10 @@ pub const MAX_QUEUE_NUM: usize = 2;
 pub const MAX_VRING_NUM: usize = 256;
 pub const MAX_MEM_SLOTS: usize = 509;
 pub const VIRTIO_FEATURES: u64 = 0x40000003;
+/// Where the dummy back-end reports a region mapped, relative to its guest
+/// physical address, in postcopy's memory table reply.
+#[cfg(feature = "postcopy")]
+pub const DUMMY_POSTCOPY_MAPPING_OFFSET: u64 = 0x7f00_0000_0000;
 
 #[derive(Default)]
 pub struct DummyBackendReqHandler {
@@ -359,6 +363,11 @@ impl VhostUserBackendReqHandlerMut for DummyBackendReqHandler {
     #[cfg(feature = "postcopy")]
     fn postcopy_end(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    #[cfg(feature = "postcopy")]
+    fn postcopy_region_base(&mut self, guest_phys_addr: u64) -> Result<u64> {
+        Ok(DUMMY_POSTCOPY_MAPPING_OFFSET + guest_phys_addr)
     }
     fn set_log_base(&mut self, _log: &VhostUserLog, _file: File) -> Result<()> {
         Ok(())
