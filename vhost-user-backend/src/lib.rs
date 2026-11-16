@@ -31,6 +31,9 @@ pub use self::handler::VhostUserHandlerError;
 pub mod bitmap;
 use crate::bitmap::BitmapReplace;
 
+#[cfg(feature = "postcopy")]
+mod uffd;
+
 mod vring;
 pub use self::vring::{
     VringMutex, VringRwLock, VringState, VringStateGuard, VringStateMutGuard, VringT,

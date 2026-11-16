@@ -7,15 +7,13 @@ use std::error;
 use std::fs::File;
 use std::io;
 use std::os::fd::AsFd;
-#[cfg(feature = "postcopy")]
-use std::os::fd::FromRawFd;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::thread;
 
 use crate::bitmap::{BitmapReplace, MemRegionBitmap, MmapLogReg};
 #[cfg(feature = "postcopy")]
-use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
+use crate::uffd::Uffd;
 use vhost::vhost_user::message::{
     VhostTransferStateDirection, VhostTransferStatePhase, VhostUserConfigFlags, VhostUserLog,
     VhostUserMemoryRegion, VhostUserProtocolFeatures, VhostUserShMemConfig, VhostUserSharedMsg,
@@ -202,11 +200,8 @@ impl<T: VhostUserBackend> VhostUserHandler<T> {
             )));
         };
         for mapping in mappings {
-            uffd.register(
-                mapping.local_addr as *mut libc::c_void,
-                mapping.size as usize,
-            )
-            .map_err(|e| VhostUserError::ReqHandlerError(io::Error::other(e)))?;
+            uffd.register(mapping.local_addr, mapping.size)
+                .map_err(VhostUserError::ReqHandlerError)?;
         }
         Ok(())
     }
@@ -728,37 +723,14 @@ where
 
     #[cfg(feature = "postcopy")]
     fn postcopy_advice(&mut self) -> VhostUserResult<File> {
-        let mut uffd_builder = UffdBuilder::new();
-
         // The front-end learns from unmap events when a mapping it serves
         // faults for is gone, so it can stop serving this userfaultfd once
         // none remain.
-        let uffd = uffd_builder
-            .close_on_exec(true)
-            .non_blocking(true)
-            .user_mode_only(false)
-            .require_features(FeatureFlags::EVENT_UNMAP)
-            .create()
-            .map_err(|e| VhostUserError::ReqHandlerError(io::Error::other(e)))?;
-
-        // We need to duplicate the uffd fd because we need both
-        // to return File with fd and store fd inside uffd.
-        //
-        // SAFETY:
-        // We know that uffd is correctly created.
-        // This means fd inside uffd is also a valid fd.
-        // Duplicating a valid fd is safe.
-        let uffd_dup = unsafe { libc::dup(uffd.as_raw_fd()) };
-        if uffd_dup < 0 {
-            return Err(VhostUserError::ReqHandlerError(io::Error::last_os_error()));
-        }
-
-        // SAFETY:
-        // We know that uffd_dup is a valid fd.
-        let uffd_file = unsafe { File::from_raw_fd(uffd_dup) };
-
+        let uffd = Uffd::create().map_err(VhostUserError::ReqHandlerError)?;
+        let uffd_file = uffd
+            .try_clone_file()
+            .map_err(VhostUserError::ReqHandlerError)?;
         self.uffd = Some(uffd);
-
         Ok(uffd_file)
     }
 
