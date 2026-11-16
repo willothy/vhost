@@ -76,8 +76,13 @@ pub trait VhostUserBackendReqHandler {
     fn add_mem_region(&self, region: &VhostUserSingleMemoryRegion, fd: File) -> Result<()>;
     /// Where the back-end mapped the memory region at `guest_phys_addr`,
     /// which postcopy's `SET_MEM_TABLE` reply reports to the front-end.
+    /// A back-end without postcopy support refuses it.
     #[cfg(feature = "postcopy")]
-    fn postcopy_region_base(&self, guest_phys_addr: u64) -> Result<u64>;
+    fn postcopy_region_base(&self, _guest_phys_addr: u64) -> Result<u64> {
+        Err(Error::InvalidOperation(
+            "postcopy is not supported by this back-end",
+        ))
+    }
     fn remove_mem_region(&self, region: &VhostUserSingleMemoryRegion) -> Result<()>;
     fn set_device_state_fd(
         &self,
