@@ -143,8 +143,14 @@ pub trait VhostUserBackendReqHandlerMut {
     fn set_inflight_fd(&mut self, inflight: &VhostUserInflight, file: File) -> Result<()>;
     fn get_max_mem_slots(&mut self) -> Result<u64>;
     fn add_mem_region(&mut self, region: &VhostUserSingleMemoryRegion, fd: File) -> Result<()>;
+    /// Where the back-end mapped the memory region at `guest_phys_addr`.
+    /// A back-end without postcopy support refuses it.
     #[cfg(feature = "postcopy")]
-    fn postcopy_region_base(&mut self, guest_phys_addr: u64) -> Result<u64>;
+    fn postcopy_region_base(&mut self, _guest_phys_addr: u64) -> Result<u64> {
+        Err(Error::InvalidOperation(
+            "postcopy is not supported by this back-end",
+        ))
+    }
     fn remove_mem_region(&mut self, region: &VhostUserSingleMemoryRegion) -> Result<()>;
     fn set_device_state_fd(
         &mut self,
@@ -154,12 +160,28 @@ pub trait VhostUserBackendReqHandlerMut {
     ) -> Result<Option<File>>;
     fn check_device_state(&mut self) -> Result<()>;
     fn get_shmem_config(&mut self) -> Result<VhostUserShMemConfig>;
+    /// Open the userfaultfd for a postcopy the front-end advises. A back-end
+    /// without postcopy support refuses it, as it does every postcopy
+    /// request, so enabling the feature never breaks a back-end that does
+    /// not implement it.
     #[cfg(feature = "postcopy")]
-    fn postcopy_advice(&mut self) -> Result<File>;
+    fn postcopy_advice(&mut self) -> Result<File> {
+        Err(Error::InvalidOperation(
+            "postcopy is not supported by this back-end",
+        ))
+    }
     #[cfg(feature = "postcopy")]
-    fn postcopy_listen(&mut self) -> Result<()>;
+    fn postcopy_listen(&mut self) -> Result<()> {
+        Err(Error::InvalidOperation(
+            "postcopy is not supported by this back-end",
+        ))
+    }
     #[cfg(feature = "postcopy")]
-    fn postcopy_end(&mut self) -> Result<()>;
+    fn postcopy_end(&mut self) -> Result<()> {
+        Err(Error::InvalidOperation(
+            "postcopy is not supported by this back-end",
+        ))
+    }
     fn set_log_base(&mut self, log: &VhostUserLog, file: File) -> Result<()>;
 }
 
