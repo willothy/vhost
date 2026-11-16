@@ -46,9 +46,12 @@ pub(crate) struct Uffd {
 impl Uffd {
     /// Create a nonblocking, close-on-exec userfaultfd with
     /// `UFFD_FEATURE_EVENT_UNMAP`, handling kernel-mode faults too. Opens
-    /// `/dev/userfaultfd`, whose file permissions govern access, and when
-    /// that fails falls back to the `userfaultfd(2)` syscall, which needs
-    /// privilege unless `vm.unprivileged_userfaultfd` is set.
+    /// `/dev/userfaultfd`, whose file permissions govern access, and only
+    /// on a kernel without that device falls back to the `userfaultfd(2)`
+    /// syscall, which needs privilege unless `vm.unprivileged_userfaultfd`
+    /// is set. Any other failure to open the device is returned as is: the
+    /// device exists, so its permissions are what the caller must fix, and
+    /// a sandbox that grants the device may well forbid the syscall.
     pub(crate) fn create() -> io::Result<Self> {
         let flags = libc::O_CLOEXEC | libc::O_NONBLOCK;
         let fd = match File::options()
@@ -67,7 +70,7 @@ impl Uffd {
                 // SAFETY: the ioctl returned a fresh descriptor we now own.
                 unsafe { OwnedFd::from_raw_fd(raw) }
             }
-            Err(_) => {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 // SAFETY: the userfaultfd syscall takes its flags by value
                 // and returns a fresh descriptor or -1.
                 let raw = unsafe { libc::syscall(libc::SYS_userfaultfd, flags) };
@@ -77,6 +80,7 @@ impl Uffd {
                 // SAFETY: the syscall returned a fresh descriptor we now own.
                 unsafe { OwnedFd::from_raw_fd(raw as i32) }
             }
+            Err(error) => return Err(error),
         };
 
         let mut api = UffdioApi {
