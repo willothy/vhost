@@ -105,8 +105,9 @@ Due to how Xen handles memory mappings the `postcopy` feature is not compatible
 with `xen` feature. Enabling both at the same time will result in a compilation error.
 
 `postcopy` feature enables optional `userfaultfd` dependency in order to create and
-interact with `userfaultfd` object. This requires access permission to `/dev/userfaultfd`
-file from the backend.
+interact with `userfaultfd` object. The backend's userfaultfd handles user-mode faults
+only (`UFFD_USER_MODE_ONLY`), so a backend must touch each page of guest memory it passes
+to the kernel from user space first.
 
 ## Xen support
 

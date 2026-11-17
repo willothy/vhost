@@ -13,8 +13,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 const UFFDIO_API: libc::c_ulong = 0xc018_aa3f;
 /// `_IOWR(0xAA, 0x00, struct uffdio_register)`.
 const UFFDIO_REGISTER: libc::c_ulong = 0xc020_aa00;
-/// `_IO(0xAA, 0x00)` on `/dev/userfaultfd`: create a userfaultfd.
-const USERFAULTFD_IOC_NEW: libc::c_ulong = 0x0000_aa00;
+/// `UFFD_USER_MODE_ONLY`: the userfaultfd handles faults user-space code
+/// takes, and the kernel's own accesses to its ranges fail instead.
+const UFFD_USER_MODE_ONLY: libc::c_int = 1;
 /// `UFFD_API`.
 const UFFD_API: u64 = 0xaa;
 /// `UFFD_FEATURE_EVENT_UNMAP`.
@@ -48,43 +49,28 @@ pub(crate) struct Uffd {
 
 impl Uffd {
     /// Create a nonblocking, close-on-exec userfaultfd with
-    /// `UFFD_FEATURE_EVENT_UNMAP`, handling kernel-mode faults too. Opens
-    /// `/dev/userfaultfd`, whose file permissions govern access, and only
-    /// on a kernel without that device falls back to the `userfaultfd(2)`
-    /// syscall, which needs privilege unless `vm.unprivileged_userfaultfd`
-    /// is set. Any other failure to open the device is returned as is: the
-    /// device exists, so its permissions are what the caller must fix, and
-    /// a sandbox that grants the device may well forbid the syscall.
+    /// `UFFD_FEATURE_EVENT_UNMAP` that handles user-mode faults only
+    /// (`UFFD_USER_MODE_ONLY`, Linux 5.11+), through the `userfaultfd(2)`
+    /// syscall, which needs no privilege for one.
+    ///
+    /// The kernel's own accesses to a registered range that is not yet
+    /// served are never held for the front-end: they fail, as `EFAULT` from
+    /// a syscall. A backend passing guest memory to the kernel (`preadv2`
+    /// into a request's buffer, say) must therefore touch each page of it
+    /// from user space first, which faults the page in through the
+    /// front-end. A userfaultfd that holds kernel accesses would let the
+    /// backend stall the kernel at a chosen point, which is how kernel
+    /// races are won.
     pub(crate) fn create() -> io::Result<Self> {
-        let flags = libc::O_CLOEXEC | libc::O_NONBLOCK;
-        let fd = match File::options()
-            .read(true)
-            .write(true)
-            .open("/dev/userfaultfd")
-        {
-            Ok(device) => {
-                // SAFETY: USERFAULTFD_IOC_NEW on the open device takes the
-                // new descriptor's flags by value and returns it.
-                let raw =
-                    unsafe { libc::ioctl(device.as_raw_fd(), USERFAULTFD_IOC_NEW as _, flags) };
-                if raw < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                // SAFETY: the ioctl returned a fresh descriptor we now own.
-                unsafe { OwnedFd::from_raw_fd(raw) }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                // SAFETY: the userfaultfd syscall takes its flags by value
-                // and returns a fresh descriptor or -1.
-                let raw = unsafe { libc::syscall(libc::SYS_userfaultfd, flags) };
-                if raw < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                // SAFETY: the syscall returned a fresh descriptor we now own.
-                unsafe { OwnedFd::from_raw_fd(raw as i32) }
-            }
-            Err(error) => return Err(error),
-        };
+        let flags = UFFD_USER_MODE_ONLY | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        // SAFETY: the userfaultfd syscall takes its flags by value and
+        // returns a fresh descriptor or -1.
+        let raw = unsafe { libc::syscall(libc::SYS_userfaultfd, flags) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the syscall returned a fresh descriptor we now own.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
 
         let mut api = UffdioApi {
             api: UFFD_API,
